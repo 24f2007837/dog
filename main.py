@@ -23,38 +23,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------------------
-# 1. Catalog Setup (Fixed IDs 1 through T)
-# ------------------------------------------------------------------------------
+# Catalog Setup (Fixed IDs 1 through T)
 CATALOG: List[Dict] = [
     {"id": i, "item": f"Order #{i}", "created_at": "2026-10-18T20:00:00Z"}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
-# In-memory storage for idempotency keys -> order response
 IDEMPOTENCY_STORE: Dict[str, Dict] = {}
-
-# In-memory storage for rate limiting: client_id -> list of request timestamps
 CLIENT_REQUESTS: Dict[str, List[float]] = defaultdict(list)
 
-
-# ------------------------------------------------------------------------------
-# 3. Rate Limiting Middleware / Helper
-# ------------------------------------------------------------------------------
+# Rate Limiting Middleware (Bypasses OPTIONS preflight)
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Only rate limit endpoints under /orders
+    # Allow CORS preflight OPTIONS requests to pass through immediately
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     client_id = request.headers.get("X-Client-Id")
     if client_id and request.url.path.startswith("/orders"):
         now = time.time()
         timestamps = CLIENT_REQUESTS[client_id]
         
-        # Remove timestamps outside the 10-second sliding window
         valid_timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW]
         CLIENT_REQUESTS[client_id] = valid_timestamps
         
         if len(valid_timestamps) >= RATE_LIMIT_R:
-            # Calculate retry after time
             oldest_in_window = valid_timestamps[0]
             retry_after = int(RATE_LIMIT_WINDOW - (now - oldest_in_window)) + 1
             return Response(
@@ -64,24 +57,12 @@ async def rate_limit_middleware(request: Request, call_next):
                 media_type="application/json",
             )
         
-        # Record request
         CLIENT_REQUESTS[client_id].append(now)
 
     response = await call_next(request)
     return response
 
-
-# ------------------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------------------
-class OrderCreateResponse(BaseModel):
-    id: str
-    status: str = "created"
-
-
-# ------------------------------------------------------------------------------
-# 1. Idempotent Order Creation
-# ------------------------------------------------------------------------------
+# Idempotent Order Creation
 @app.post("/orders", status_code=status.HTTP_201_CREATED)
 def create_order(
     response: Response,
@@ -89,7 +70,6 @@ def create_order(
 ):
     if idempotency_key:
         if idempotency_key in IDEMPOTENCY_STORE:
-            # Return cached order ID on duplicate calls
             response.status_code = status.HTTP_201_CREATED
             return IDEMPOTENCY_STORE[idempotency_key]
 
@@ -98,13 +78,9 @@ def create_order(
         IDEMPOTENCY_STORE[idempotency_key] = res_data
         return res_data
     
-    # If no key provided, generate standard new order
     return {"id": str(uuid.uuid4()), "status": "created"}
 
-
-# ------------------------------------------------------------------------------
-# 2. Cursor-Based Pagination
-# ------------------------------------------------------------------------------
+# Cursor-Based Pagination
 def encode_cursor(offset: int) -> str:
     return base64.b64encode(str(offset).encode("utf-8")).decode("utf-8")
 
